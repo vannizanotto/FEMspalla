@@ -168,9 +168,17 @@
         import * as THREE from 'three';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-        // --- TRUE FEM SOLVER WITH ADAPTIVE MESH ---
+        // ============================================================
+        // TRUE FEM SOLVER WITH ADAPTIVE MESH ---
+        // ============================================================
         const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
         const safeSqrt = (v) => v > 1e-9 ? Math.sqrt(v) : 0;
+
+        // FEM Constants
+        const SPARSE_MATRIX_TOLERANCE = 1e-15;  // Minimum value to store in sparse matrix
+        const MIN_DIAGONAL_VALUE = 1e-12;        // Minimum diagonal value for preconditioner
+        const PENALTY_VALUE = 1e30;              // Large value for penalty method boundary conditions
+        const MIN_JACOBIAN_DETERMINANT = 1e-12;  // Minimum Jacobian determinant for valid elements
 
         const W_BASE = 30, H_BASE = 50, L_TOTAL = 100, Y_LOAD = 100;
         const materials = {
@@ -189,7 +197,7 @@
             }
             
             set(i, j, value) {
-                if (Math.abs(value) > 1e-15) {
+                if (Math.abs(value) > SPARSE_MATRIX_TOLERANCE) {
                     this.data.set(`${i},${j}`, value);
                 }
             }
@@ -239,6 +247,12 @@
             // Build 6x6 constitutive matrix for 3D elasticity
             buildConstitutiveMatrix() {
                 const E = this.E, nu = this.nu;
+                
+                // Validate Poisson's ratio to avoid singularity
+                if (Math.abs(1 - 2 * nu) < 1e-6) {
+                    throw new Error(`Invalid Poisson's ratio nu=${nu}. Material is nearly incompressible (nu ≈ 0.5).`);
+                }
+                
                 const lambda = E * nu / ((1 + nu) * (1 - 2 * nu));
                 const mu = E / (2 * (1 + nu));
                 const D = new Array(6).fill(0).map(() => new Array(6).fill(0));
@@ -310,7 +324,7 @@
             // Inverse of 3x3 matrix
             inv3x3(M) {
                 const det = this.det3x3(M);
-                if (Math.abs(det) < 1e-12) return null;
+                if (Math.abs(det) < MIN_JACOBIAN_DETERMINANT) return null;
                 
                 const inv = [[0,0,0], [0,0,0], [0,0,0]];
                 inv[0][0] = (M[1][1]*M[2][2] - M[1][2]*M[2][1]) / det;
@@ -435,7 +449,7 @@
                 // Jacobi preconditioner: M = diag(K)
                 const M_inv = K.getDiagonal();
                 for (let i = 0; i < n; i++) {
-                    M_inv[i] = M_inv[i] > 1e-12 ? 1.0 / M_inv[i] : 0;
+                    M_inv[i] = M_inv[i] > MIN_DIAGONAL_VALUE ? 1.0 / M_inv[i] : 0;
                 }
                 
                 // Initial residual: r = F - K*U (U=0, so r=F)
@@ -848,12 +862,11 @@
             const rOut = state.De / 2;
             
             // Constraints: fix nodes at y ≈ -rOut (bottom of hub)
-            const penalty = 1e30;
             nodes.forEach((node, idx) => {
                 if (node.y < -rOut * 0.9) {
-                    K.set(idx*3, idx*3, penalty);
-                    K.set(idx*3+1, idx*3+1, penalty);
-                    K.set(idx*3+2, idx*3+2, penalty);
+                    K.set(idx*3, idx*3, PENALTY_VALUE);
+                    K.set(idx*3+1, idx*3+1, PENALTY_VALUE);
+                    K.set(idx*3+2, idx*3+2, PENALTY_VALUE);
                     F[idx*3] = 0;
                     F[idx*3+1] = 0;
                     F[idx*3+2] = 0;

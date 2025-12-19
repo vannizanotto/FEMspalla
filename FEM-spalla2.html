@@ -77,10 +77,10 @@
 
     <div id="loader">
         <div style="border: 3px solid #222; border-top: 3px solid #00bfff; border-radius: 50%; width: 50px; height: 50px; animation: spin 0.8s linear infinite;"></div>
-        <div style="margin-top: 25px; color:#00bfff; font-size: 11px; letter-spacing: 3px; font-weight: bold;">RIPRISTINO VARIABILI GLOBALI V83...</div>
+        <div style="margin-top: 25px; color:#00bfff; font-size: 11px; letter-spacing: 3px; font-weight: bold;">INIZIALIZZAZIONE SOLUTORE FEM...</div>
     </div>
 
-    <div id="solver-toast">CALCOLO EQUILIBRIO ELASTICO...</div>
+    <div id="solver-toast">CALCOLO FEM IN CORSO...</div>
 
     <div id="canvas-container"></div>
 
@@ -135,6 +135,10 @@
             <input type="range" id="i-clip" min="-25" max="150" step="1" value="150">
 
             <div class="results-card">
+                <div class="stat-line"><span>Nodi Mesh</span><span id="r-nodes" class="val">--</span></div>
+                <div class="stat-line"><span>Elementi Mesh</span><span id="r-elements" class="val">--</span></div>
+                <div class="stat-line"><span>Iterazioni Solver</span><span id="r-iterations" class="val">--</span></div>
+                <div class="stat-line"><span>Tempo Calcolo</span><span id="r-time" class="val">--</span></div>
                 <div class="stat-line"><span>Stress Von Mises Max</span><span id="r-stress" class="val">-- MPa</span></div>
                 <div class="stat-line"><span>Safety Factor</span><span id="r-sf" class="val">--</span></div>
                 <div id="r-status-box" class="status-badge">---</div>
@@ -164,23 +168,532 @@
         import * as THREE from 'three';
         import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 
-        // --- SOLUTORE FEM PRO V83 ---
+        // --- TRUE FEM SOLVER WITH ADAPTIVE MESH ---
         const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
         const safeSqrt = (v) => v > 1e-9 ? Math.sqrt(v) : 0;
 
         const W_BASE = 30, H_BASE = 50, L_TOTAL = 100, Y_LOAD = 100;
         const materials = {
-            'al_pd': { E: 71000, Yield: 140 },
-            'al_g':  { E: 74000, Yield: 210 },
-            'zamak': { E: 85000, Yield: 370 }
+            'al_pd': { E: 71000, Yield: 140, nu: 0.33 },
+            'al_g':  { E: 74000, Yield: 210, nu: 0.33 },
+            'zamak': { E: 85000, Yield: 370, nu: 0.27 }
         };
+
+        // ============================================================
+        // SPARSE MATRIX CLASS (CSR-like format using Map)
+        // ============================================================
+        class SparseMatrix {
+            constructor(size) {
+                this.size = size;
+                this.data = new Map(); // key: "i,j" -> value
+            }
+            
+            set(i, j, value) {
+                if (Math.abs(value) > 1e-15) {
+                    this.data.set(`${i},${j}`, value);
+                }
+            }
+            
+            add(i, j, value) {
+                const key = `${i},${j}`;
+                const current = this.data.get(key) || 0;
+                this.set(i, j, current + value);
+            }
+            
+            get(i, j) {
+                return this.data.get(`${i},${j}`) || 0;
+            }
+            
+            // Sparse matrix-vector multiplication: result = A * x
+            multiply(x) {
+                const result = new Float64Array(this.size);
+                for (const [key, value] of this.data.entries()) {
+                    const [i, j] = key.split(',').map(Number);
+                    result[i] += value * x[j];
+                }
+                return result;
+            }
+            
+            // Get diagonal for preconditioning
+            getDiagonal() {
+                const diag = new Float64Array(this.size);
+                for (let i = 0; i < this.size; i++) {
+                    diag[i] = this.get(i, i) || 1.0;
+                }
+                return diag;
+            }
+        }
+
+        // ============================================================
+        // HEX8 FINITE ELEMENT (8-node brick element)
+        // ============================================================
+        class Hex8Element {
+            constructor(nodeCoords, E, nu) {
+                // nodeCoords: array of 8 nodes, each {x, y, z}
+                this.nodes = nodeCoords;
+                this.E = E;
+                this.nu = nu;
+                this.D = this.buildConstitutiveMatrix();
+            }
+            
+            // Build 6x6 constitutive matrix for 3D elasticity
+            buildConstitutiveMatrix() {
+                const E = this.E, nu = this.nu;
+                const lambda = E * nu / ((1 + nu) * (1 - 2 * nu));
+                const mu = E / (2 * (1 + nu));
+                const D = new Array(6).fill(0).map(() => new Array(6).fill(0));
+                
+                // Voigt notation: [σxx, σyy, σzz, τxy, τyz, τzx]
+                D[0][0] = D[1][1] = D[2][2] = lambda + 2*mu;
+                D[0][1] = D[0][2] = D[1][0] = D[1][2] = D[2][0] = D[2][1] = lambda;
+                D[3][3] = D[4][4] = D[5][5] = mu;
+                
+                return D;
+            }
+            
+            // Shape functions in natural coordinates (ξ, η, ζ) ∈ [-1,1]
+            shapeFunction(xi, eta, zeta) {
+                const N = new Float64Array(8);
+                const coords = [
+                    [-1,-1,-1], [1,-1,-1], [1,1,-1], [-1,1,-1],
+                    [-1,-1,1], [1,-1,1], [1,1,1], [-1,1,1]
+                ];
+                for (let i = 0; i < 8; i++) {
+                    const [xi_i, eta_i, zeta_i] = coords[i];
+                    N[i] = 0.125 * (1 + xi_i*xi) * (1 + eta_i*eta) * (1 + zeta_i*zeta);
+                }
+                return N;
+            }
+            
+            // Derivatives of shape functions w.r.t. natural coords
+            shapeFunctionDerivatives(xi, eta, zeta) {
+                const dN = Array(8).fill(0).map(() => [0, 0, 0]);
+                const coords = [
+                    [-1,-1,-1], [1,-1,-1], [1,1,-1], [-1,1,-1],
+                    [-1,-1,1], [1,-1,1], [1,1,1], [-1,1,1]
+                ];
+                for (let i = 0; i < 8; i++) {
+                    const [xi_i, eta_i, zeta_i] = coords[i];
+                    dN[i][0] = 0.125 * xi_i * (1 + eta_i*eta) * (1 + zeta_i*zeta);   // dN/dξ
+                    dN[i][1] = 0.125 * (1 + xi_i*xi) * eta_i * (1 + zeta_i*zeta);    // dN/dη
+                    dN[i][2] = 0.125 * (1 + xi_i*xi) * (1 + eta_i*eta) * zeta_i;     // dN/dζ
+                }
+                return dN;
+            }
+            
+            // Jacobian matrix: J = ∂(x,y,z)/∂(ξ,η,ζ)
+            jacobian(xi, eta, zeta) {
+                const dN = this.shapeFunctionDerivatives(xi, eta, zeta);
+                const J = [[0,0,0], [0,0,0], [0,0,0]];
+                
+                for (let i = 0; i < 8; i++) {
+                    J[0][0] += dN[i][0] * this.nodes[i].x;  // ∂x/∂ξ
+                    J[0][1] += dN[i][0] * this.nodes[i].y;  // ∂y/∂ξ
+                    J[0][2] += dN[i][0] * this.nodes[i].z;  // ∂z/∂ξ
+                    J[1][0] += dN[i][1] * this.nodes[i].x;  // ∂x/∂η
+                    J[1][1] += dN[i][1] * this.nodes[i].y;  // ∂y/∂η
+                    J[1][2] += dN[i][1] * this.nodes[i].z;  // ∂z/∂η
+                    J[2][0] += dN[i][2] * this.nodes[i].x;  // ∂x/∂ζ
+                    J[2][1] += dN[i][2] * this.nodes[i].y;  // ∂y/∂ζ
+                    J[2][2] += dN[i][2] * this.nodes[i].z;  // ∂z/∂ζ
+                }
+                return J;
+            }
+            
+            // Determinant of 3x3 matrix
+            det3x3(M) {
+                return M[0][0]*(M[1][1]*M[2][2] - M[1][2]*M[2][1]) -
+                       M[0][1]*(M[1][0]*M[2][2] - M[1][2]*M[2][0]) +
+                       M[0][2]*(M[1][0]*M[2][1] - M[1][1]*M[2][0]);
+            }
+            
+            // Inverse of 3x3 matrix
+            inv3x3(M) {
+                const det = this.det3x3(M);
+                if (Math.abs(det) < 1e-12) return null;
+                
+                const inv = [[0,0,0], [0,0,0], [0,0,0]];
+                inv[0][0] = (M[1][1]*M[2][2] - M[1][2]*M[2][1]) / det;
+                inv[0][1] = (M[0][2]*M[2][1] - M[0][1]*M[2][2]) / det;
+                inv[0][2] = (M[0][1]*M[1][2] - M[0][2]*M[1][1]) / det;
+                inv[1][0] = (M[1][2]*M[2][0] - M[1][0]*M[2][2]) / det;
+                inv[1][1] = (M[0][0]*M[2][2] - M[0][2]*M[2][0]) / det;
+                inv[1][2] = (M[0][2]*M[1][0] - M[0][0]*M[1][2]) / det;
+                inv[2][0] = (M[1][0]*M[2][1] - M[1][1]*M[2][0]) / det;
+                inv[2][1] = (M[0][1]*M[2][0] - M[0][0]*M[2][1]) / det;
+                inv[2][2] = (M[0][0]*M[1][1] - M[0][1]*M[1][0]) / det;
+                return inv;
+            }
+            
+            // B matrix (strain-displacement): 6x24
+            buildBMatrix(xi, eta, zeta) {
+                const dN_natural = this.shapeFunctionDerivatives(xi, eta, zeta);
+                const J = this.jacobian(xi, eta, zeta);
+                const invJ = this.inv3x3(J);
+                if (!invJ) return null;
+                
+                // Transform derivatives to physical coordinates
+                const dN_phys = Array(8).fill(0).map(() => [0, 0, 0]);
+                for (let i = 0; i < 8; i++) {
+                    for (let j = 0; j < 3; j++) {
+                        dN_phys[i][j] = invJ[j][0]*dN_natural[i][0] + 
+                                       invJ[j][1]*dN_natural[i][1] + 
+                                       invJ[j][2]*dN_natural[i][2];
+                    }
+                }
+                
+                // Build B matrix (6 x 24)
+                const B = Array(6).fill(0).map(() => Array(24).fill(0));
+                for (let i = 0; i < 8; i++) {
+                    const col = i * 3;
+                    B[0][col]   = dN_phys[i][0];  // εxx
+                    B[1][col+1] = dN_phys[i][1];  // εyy
+                    B[2][col+2] = dN_phys[i][2];  // εzz
+                    B[3][col]   = dN_phys[i][1];  B[3][col+1] = dN_phys[i][0];  // γxy
+                    B[4][col+1] = dN_phys[i][2];  B[4][col+2] = dN_phys[i][1];  // γyz
+                    B[5][col]   = dN_phys[i][2];  B[5][col+2] = dN_phys[i][0];  // γzx
+                }
+                
+                return B;
+            }
+            
+            // Element stiffness matrix Ke (24x24) with 2x2x2 Gauss integration
+            computeStiffnessMatrix() {
+                const Ke = Array(24).fill(0).map(() => new Float64Array(24));
+                const gp = 1/Math.sqrt(3); // Gauss points at ±1/√3
+                const gaussPoints = [
+                    [-gp,-gp,-gp], [gp,-gp,-gp], [gp,gp,-gp], [-gp,gp,-gp],
+                    [-gp,-gp,gp], [gp,-gp,gp], [gp,gp,gp], [-gp,gp,gp]
+                ];
+                
+                for (const [xi, eta, zeta] of gaussPoints) {
+                    const B = this.buildBMatrix(xi, eta, zeta);
+                    if (!B) continue;
+                    
+                    const J = this.jacobian(xi, eta, zeta);
+                    const detJ = this.det3x3(J);
+                    if (detJ <= 0) continue;
+                    
+                    // Ke += B^T * D * B * detJ (weight=1 for all Gauss points)
+                    for (let i = 0; i < 24; i++) {
+                        for (let j = 0; j < 24; j++) {
+                            let sum = 0;
+                            for (let k = 0; k < 6; k++) {
+                                for (let l = 0; l < 6; l++) {
+                                    sum += B[k][i] * this.D[k][l] * B[l][j];
+                                }
+                            }
+                            Ke[i][j] += sum * detJ;
+                        }
+                    }
+                }
+                
+                return Ke;
+            }
+            
+            // Compute stress at element center
+            computeStress(U_element) {
+                // U_element: 24-component displacement vector for this element
+                const B = this.buildBMatrix(0, 0, 0); // Evaluate at center
+                if (!B) return null;
+                
+                // Strain: ε = B * U
+                const strain = new Float64Array(6);
+                for (let i = 0; i < 6; i++) {
+                    for (let j = 0; j < 24; j++) {
+                        strain[i] += B[i][j] * U_element[j];
+                    }
+                }
+                
+                // Stress: σ = D * ε
+                const stress = new Float64Array(6);
+                for (let i = 0; i < 6; i++) {
+                    for (let j = 0; j < 6; j++) {
+                        stress[i] += this.D[i][j] * strain[j];
+                    }
+                }
+                
+                return stress;
+            }
+        }
+
+        // ============================================================
+        // FEM SOLVER - Preconditioned Conjugate Gradient
+        // ============================================================
+        class FEMSolver {
+            constructor(tolerance = 1e-6, maxIterations = 2000) {
+                this.tolerance = tolerance;
+                this.maxIterations = maxIterations;
+                this.iterations = 0;
+            }
+            
+            // Solve K * U = F using PCG with Jacobi preconditioner
+            solve(K, F) {
+                const n = K.size;
+                const U = new Float64Array(n);
+                
+                // Jacobi preconditioner: M = diag(K)
+                const M_inv = K.getDiagonal();
+                for (let i = 0; i < n; i++) {
+                    M_inv[i] = M_inv[i] > 1e-12 ? 1.0 / M_inv[i] : 0;
+                }
+                
+                // Initial residual: r = F - K*U (U=0, so r=F)
+                let r = new Float64Array(F);
+                
+                // Preconditioned residual: z = M^-1 * r
+                let z = new Float64Array(n);
+                for (let i = 0; i < n; i++) z[i] = M_inv[i] * r[i];
+                
+                // Initial search direction
+                let p = new Float64Array(z);
+                let rzOld = this.dot(r, z);
+                
+                this.iterations = 0;
+                for (let iter = 0; iter < this.maxIterations; iter++) {
+                    this.iterations = iter + 1;
+                    
+                    // Ap = K * p
+                    const Ap = K.multiply(p);
+                    
+                    // alpha = (r^T * z) / (p^T * Ap)
+                    const pAp = this.dot(p, Ap);
+                    if (Math.abs(pAp) < 1e-20) break;
+                    const alpha = rzOld / pAp;
+                    
+                    // Update solution: U = U + alpha * p
+                    for (let i = 0; i < n; i++) U[i] += alpha * p[i];
+                    
+                    // Update residual: r = r - alpha * Ap
+                    for (let i = 0; i < n; i++) r[i] -= alpha * Ap[i];
+                    
+                    // Check convergence
+                    const residualNorm = Math.sqrt(this.dot(r, r));
+                    if (residualNorm < this.tolerance) break;
+                    
+                    // Update preconditioned residual: z = M^-1 * r
+                    for (let i = 0; i < n; i++) z[i] = M_inv[i] * r[i];
+                    
+                    // beta = (r_new^T * z_new) / (r_old^T * z_old)
+                    const rzNew = this.dot(r, z);
+                    const beta = rzNew / rzOld;
+                    rzOld = rzNew;
+                    
+                    // Update search direction: p = z + beta * p
+                    for (let i = 0; i < n; i++) p[i] = z[i] + beta * p[i];
+                }
+                
+                return U;
+            }
+            
+            dot(a, b) {
+                let sum = 0;
+                for (let i = 0; i < a.length; i++) sum += a[i] * b[i];
+                return sum;
+            }
+        }
+
+        // ============================================================
+        // ADAPTIVE MESH GENERATOR
+        // ============================================================
+        class AdaptiveMeshGenerator {
+            constructor(state, W_BASE, H_BASE, L_TOTAL) {
+                this.state = state;
+                this.W_BASE = W_BASE;
+                this.H_BASE = H_BASE;
+                this.L_TOTAL = L_TOTAL;
+            }
+            
+            // Local sizing function - smaller values = finer mesh
+            getSizingFactor(x, y, z) {
+                const rIn = this.state.Di / 2;
+                const rOut = this.state.De / 2;
+                const rGrub = this.state.grubDi / 2;
+                const pivotZ = this.H_BASE / 2;
+                
+                let factor = 1.0;
+                
+                // Refine near internal hole (Di)
+                const distHole = Math.sqrt(x*x + y*y);
+                if (distHole < rIn * 1.5) {
+                    factor = Math.min(factor, 0.4);
+                }
+                
+                // Refine near grub screw hole
+                if (this.state.grubDi > 0.1) {
+                    const distGrub = Math.sqrt(y*y + (z - pivotZ)**2);
+                    if (distGrub < rGrub * 3) {
+                        factor = Math.min(factor, 0.4);
+                    }
+                }
+                
+                // Refine in transition zone
+                if (y >= 0 && y <= this.state.delta * 1.2) {
+                    factor = Math.min(factor, 0.5);
+                }
+                
+                // Refine near load application
+                if (y > this.L_TOTAL * 0.85) {
+                    factor = Math.min(factor, 0.5);
+                }
+                
+                // Refine in fillet regions
+                if (this.state.fillet > 0 && y >= 0 && y <= this.state.delta) {
+                    const hw = this.getProfileHalfWidth(y);
+                    if (Math.abs(Math.abs(x) - hw) < this.state.fillet * 0.5) {
+                        factor = Math.min(factor, 0.3);
+                    }
+                }
+                
+                return factor;
+            }
+            
+            getProfileHalfWidth(y) {
+                const hw_block = this.W_BASE / 2, hw_hub = this.state.De / 2;
+                if (y >= this.state.delta) return hw_block; 
+                if (y <= 0) {
+                    const dy = Math.abs(y);
+                    return dy > hw_hub ? 0.05 : safeSqrt(hw_hub**2 - dy**2);
+                }
+                const t = clamp(y / this.state.delta, 0, 1), s = (3 * t**2 - 2 * t**3); 
+                const neckEffect = this.state.fillet * Math.sin(t * Math.PI); 
+                let currentHW;
+                if (this.state.filletType === 'convex') currentHW = hw_hub + (hw_block - hw_hub) * s + neckEffect;
+                else currentHW = hw_hub + (hw_block - hw_hub) * s - neckEffect;
+                return Math.max(1, currentHW);
+            }
+            
+            // Generate adaptive mesh
+            generate() {
+                const nodes = [];
+                const elements = [];
+                const nodeMap = new Map();
+                const rIn = this.state.Di / 2;
+                const rGrub = this.state.grubDi / 2;
+                const rOut = this.state.De / 2;
+                const pivotZ = this.H_BASE / 2;
+                
+                const getNode = (x, y, z) => {
+                    const key = `${x.toFixed(3)},${y.toFixed(3)},${z.toFixed(3)}`;
+                    if (nodeMap.has(key)) return nodeMap.get(key);
+                    const node = { x, y, z, vm: 0, count: 0 };
+                    nodes.push(node);
+                    nodeMap.set(key, nodes.length - 1);
+                    return nodes.length - 1;
+                };
+                
+                // Sample mesh at midpoint to determine local size
+                const baseStep = this.state.meshRes;
+                const xSegments = 20;
+                
+                for (let y = -rOut; y < this.L_TOTAL; y += baseStep * 0.8) {
+                    const hw0 = this.getProfileHalfWidth(y);
+                    const hw1 = this.getProfileHalfWidth(y + baseStep);
+                    
+                    // Adaptive sizing in y direction
+                    const midY = y + baseStep * 0.5;
+                    const sizeFactor = this.getSizingFactor(0, midY, pivotZ);
+                    const stepY = baseStep * sizeFactor;
+                    
+                    for (let x_idx = -xSegments; x_idx < xSegments; x_idx++) {
+                        const tx0 = x_idx / xSegments, tx1 = (x_idx + 1) / xSegments;
+                        const x0a = tx0 * hw0, x0b = tx1 * hw0;
+                        const x1a = tx0 * hw1, x1b = tx1 * hw1;
+                        const midX = (x0a + x0b) / 2;
+                        
+                        // Adaptive sizing in z direction
+                        const zSizeFactor = this.getSizingFactor(midX, midY, pivotZ);
+                        const stepZ = baseStep * zSizeFactor;
+                        
+                        for (let z = 0; z < this.H_BASE; z += stepZ) {
+                            const distPin = safeSqrt(midX**2 + y**2);
+                            const distGrub = safeSqrt(y**2 + (z - pivotZ)**2);
+                            
+                            // Skip elements inside holes
+                            if (distPin < rIn) continue;
+                            if (this.state.grubDi > 0.1 && distGrub < rGrub && midX > rIn * 0.9) continue;
+                            
+                            // Create element with controlled aspect ratio
+                            const actualStepZ = Math.min(stepZ, this.H_BASE - z);
+                            const actualStepY = Math.min(stepY, this.L_TOTAL - y);
+                            
+                            try {
+                                const n = [
+                                    getNode(x0a, y, z), getNode(x0b, y, z),
+                                    getNode(x1b, y+actualStepY, z), getNode(x1a, y+actualStepY, z),
+                                    getNode(x0a, y, z+actualStepZ), getNode(x0b, y, z+actualStepZ),
+                                    getNode(x1b, y+actualStepY, z+actualStepZ), getNode(x1a, y+actualStepY, z+actualStepZ)
+                                ];
+                                elements.push({ nodes: n });
+                            } catch(e) {
+                                // Skip malformed elements
+                            }
+                        }
+                    }
+                }
+                
+                return { nodes, elements };
+            }
+        }
+
+        // ============================================================
+        // STRESS CALCULATOR
+        // ============================================================
+        class StressCalculator {
+            static computeVonMises(stress) {
+                // stress: [σxx, σyy, σzz, τxy, τyz, τzx]
+                const [sx, sy, sz, txy, tyz, tzx] = stress;
+                const vm = Math.sqrt(0.5 * (
+                    (sx-sy)**2 + (sy-sz)**2 + (sz-sx)**2 + 
+                    6 * (txy**2 + tyz**2 + tzx**2)
+                ));
+                return vm;
+            }
+            
+            static smoothNodalStresses(nodes, elements, U, E, nu) {
+                // Reset nodal stresses
+                nodes.forEach(n => { n.vm = 0; n.count = 0; });
+                
+                // Accumulate element stresses to nodes
+                elements.forEach(el => {
+                    const nodeCoords = el.nodes.map(idx => nodes[idx]);
+                    const element = new Hex8Element(nodeCoords, E, nu);
+                    
+                    // Get element displacement vector
+                    const U_el = new Float64Array(24);
+                    for (let i = 0; i < 8; i++) {
+                        const nodeIdx = el.nodes[i];
+                        U_el[i*3]   = U[nodeIdx*3]   || 0;
+                        U_el[i*3+1] = U[nodeIdx*3+1] || 0;
+                        U_el[i*3+2] = U[nodeIdx*3+2] || 0;
+                    }
+                    
+                    const stress = element.computeStress(U_el);
+                    if (stress) {
+                        const vm = StressCalculator.computeVonMises(stress);
+                        
+                        // Distribute to nodes
+                        el.nodes.forEach(idx => {
+                            nodes[idx].vm += vm;
+                            nodes[idx].count += 1;
+                        });
+                    }
+                });
+                
+                // Average
+                nodes.forEach(n => {
+                    if (n.count > 0) n.vm /= n.count;
+                });
+            }
+        }
 
         const state = {
             meshRes: 2.0, delta: 40, De: 40, Di: 15, grubDi: 6.0, clearance: 0.1, force: 4500, fillet: 20, filletType: 'convex', matId: 'al_pd', clipY: 150, showWireframe: false
         };
 
         let scene, camera, renderer, controls, clipPlane, mainMesh, wireMesh, pinMesh, grubMesh, forceArrow;
-        let nodes = [], elements = [], dom = {};
+        let nodes = [], elements = [], dom = {}, globalU = null;
+        let solverStats = { numNodes: 0, numElements: 0, iterations: 0, solveTime: 0 };
 
         function init() {
             const container = document.getElementById('canvas-container');
@@ -198,6 +711,8 @@
                 clip: getEl('i-clip'), vClip: getEl('v-clip'),
                 mat: getEl('sel-mat'),
                 wireframe: getEl('chk-wireframe'),
+                rNodes: getEl('r-nodes'), rElements: getEl('r-elements'),
+                rIterations: getEl('r-iterations'), rTime: getEl('r-time'),
                 rStress: getEl('r-stress'), rSf: getEl('r-sf'), rStatus: getEl('r-status-box'),
                 lMax: getEl('l-max'), lMid: getEl('l-mid'),
                 critCanvas: getEl('crit-canvas'),
@@ -280,82 +795,108 @@
 
         function rebuildFEM() {
             dom.toast.style.display = 'block';
+            dom.toast.innerText = 'GENERAZIONE MESH ADATTIVA...';
+            const startTime = performance.now();
+            
             if (mainMesh) { scene.remove(mainMesh); mainMesh.geometry.dispose(); }
             if (wireMesh) { scene.remove(wireMesh); wireMesh.geometry.dispose(); }
             
-            nodes = [];
-            elements = [];
-            const rIn = state.Di / 2, rGrub = state.grubDi / 2, rOut = state.De / 2, pivotZ = H_BASE / 2;
-            const step = state.meshRes;
-
-            let nodeMap = new Map();
-            function getNode(x, y, z) {
-                const key = `${x.toFixed(2)},${y.toFixed(2)},${z.toFixed(2)}`;
-                if (nodeMap.has(key)) return nodeMap.get(key);
-                const node = { x, y, z, vm: 0 };
-                nodes.push(node);
-                nodeMap.set(key, nodes.length - 1);
-                return nodes.length - 1;
-            }
-
-            const xSegments = 16; 
-
-            for (let y = -rOut; y < L_TOTAL; y += step) {
-                const hw0 = getProfileHalfWidth(y);
-                const hw1 = getProfileHalfWidth(y + step);
+            // Generate adaptive mesh
+            const meshGen = new AdaptiveMeshGenerator(state, W_BASE, H_BASE, L_TOTAL);
+            const mesh = meshGen.generate();
+            nodes = mesh.nodes;
+            elements = mesh.elements;
+            
+            solverStats.numNodes = nodes.length;
+            solverStats.numElements = elements.length;
+            
+            const mat = materials[state.matId];
+            const ndof = nodes.length * 3;
+            
+            dom.toast.innerText = `ASSEMBLAGGIO MATRICE GLOBALE (${elements.length} elementi)...`;
+            
+            // Assemble global stiffness matrix
+            const K = new SparseMatrix(ndof);
+            
+            elements.forEach((el, idx) => {
+                if (idx % 200 === 0) {
+                    dom.toast.innerText = `ASSEMBLAGGIO ${Math.floor(100*idx/elements.length)}%...`;
+                }
                 
-                for (let x_idx = -xSegments; x_idx < xSegments; x_idx++) {
-                    const tx0 = x_idx / xSegments, tx1 = (x_idx + 1) / xSegments;
-                    const x0a = tx0 * hw0, x0b = tx1 * hw0;
-                    const x1a = tx0 * hw1, x1b = tx1 * hw1;
-
-                    for (let z = 0; z < H_BASE; z += step) {
-                        const midX = (x0a + x0b) / 2;
-                        const distPin = safeSqrt(midX**2 + y**2);
-                        const distGrub = safeSqrt(y**2 + (z - pivotZ)**2);
-                        
-                        if (distPin < rIn) continue;
-                        if (state.grubDi > 0.1 && distGrub < rGrub && midX > rIn * 0.9) continue;
-
-                        const n = [
-                            getNode(x0a, y, z), getNode(x0b, y, z),
-                            getNode(x1b, y+step, z), getNode(x1a, y+step, z),
-                            getNode(x0a, y, z+step), getNode(x0b, y, z+step),
-                            getNode(x1b, y+step, z+step), getNode(x1a, y+step, z+step)
-                        ];
-                        elements.push({ nodes: n });
+                const nodeCoords = el.nodes.map(nodeIdx => nodes[nodeIdx]);
+                const element = new Hex8Element(nodeCoords, mat.E, mat.nu);
+                const Ke = element.computeStiffnessMatrix();
+                
+                // Add to global matrix
+                for (let i = 0; i < 8; i++) {
+                    for (let j = 0; j < 8; j++) {
+                        const ni = el.nodes[i];
+                        const nj = el.nodes[j];
+                        for (let di = 0; di < 3; di++) {
+                            for (let dj = 0; dj < 3; dj++) {
+                                K.add(ni*3+di, nj*3+dj, Ke[i*3+di][j*3+dj]);
+                            }
+                        }
                     }
                 }
-            }
-
-            const mat = materials[state.matId];
-            const inertia_ref = (W_BASE * Math.pow(H_BASE, 3)) / 12;
-
-            nodes.forEach(n => {
-                const arm = Math.max(0, L_TOTAL - n.y);
-                const moment = state.force * arm;
-                const s_bend = (moment * (n.z - pivotZ)) / inertia_ref;
-                
-                let contactS = 0;
-                if (Math.abs(n.y) < rOut) {
-                    const z_rel = (n.z - pivotZ) / (H_BASE/2);
-                    if ((n.y > 0 && z_rel < -0.25) || (n.y < 0 && z_rel > 0.25)) contactS = (state.force / (state.Di * H_BASE)) * 52.0;
-                }
-
-                let Kt = 1.0;
-                const dG = safeSqrt(n.y**2 + (n.z - pivotZ)**2);
-                if (state.grubDi > 0.1 && dG < rGrub * 5 && n.x > rIn) {
-                    Kt = 1.0 + 3.8 * Math.pow(rGrub / dG, 2.2);
-                }
-
-                n.vm = safeSqrt((s_bend + contactS)**2) * Kt;
             });
-
+            
+            dom.toast.innerText = 'APPLICAZIONE CONDIZIONI AL CONTORNO...';
+            
+            // Apply boundary conditions
+            const F = new Float64Array(ndof);
+            const rOut = state.De / 2;
+            
+            // Constraints: fix nodes at y ≈ -rOut (bottom of hub)
+            const penalty = 1e30;
+            nodes.forEach((node, idx) => {
+                if (node.y < -rOut * 0.9) {
+                    K.set(idx*3, idx*3, penalty);
+                    K.set(idx*3+1, idx*3+1, penalty);
+                    K.set(idx*3+2, idx*3+2, penalty);
+                    F[idx*3] = 0;
+                    F[idx*3+1] = 0;
+                    F[idx*3+2] = 0;
+                }
+            });
+            
+            // Apply load at top nodes
+            let loadNodeCount = 0;
+            nodes.forEach((node, idx) => {
+                if (node.y > Y_LOAD * 0.95) {
+                    loadNodeCount++;
+                }
+            });
+            
+            if (loadNodeCount > 0) {
+                const forcePerNode = -state.force / loadNodeCount; // Negative Y direction
+                nodes.forEach((node, idx) => {
+                    if (node.y > Y_LOAD * 0.95) {
+                        F[idx*3+1] += forcePerNode;
+                    }
+                });
+            }
+            
+            dom.toast.innerText = 'RISOLUZIONE SISTEMA PCG...';
+            
+            // Solve K*U = F
+            const solver = new FEMSolver(1e-6, 2000);
+            globalU = solver.solve(K, F);
+            solverStats.iterations = solver.iterations;
+            
+            dom.toast.innerText = 'CALCOLO STRESS...';
+            
+            // Compute stresses
+            StressCalculator.smoothNodalStresses(nodes, elements, globalU, mat.E, mat.nu);
+            
+            solverStats.solveTime = performance.now() - startTime;
+            
+            // Visualization
             const geometry = new THREE.BufferGeometry();
             const positions = [];
             const colors = [];
             const colorObj = new THREE.Color();
-
+            
             elements.forEach(el => {
                 const ns = el.nodes.map(id => nodes[id]);
                 const avgVM = ns.reduce((acc, n) => acc + n.vm, 0) / 8;
@@ -386,7 +927,12 @@
                 scene.add(wireMesh);
             }
 
+            // Update UI
             const maxVMGlobal = nodes.length > 0 ? Math.max(...nodes.map(n => n.vm)) : 0;
+            dom.rNodes.innerText = solverStats.numNodes;
+            dom.rElements.innerText = solverStats.numElements;
+            dom.rIterations.innerText = solverStats.iterations;
+            dom.rTime.innerText = (solverStats.solveTime / 1000).toFixed(2) + ' s';
             dom.rStress.innerText = maxVMGlobal.toFixed(1) + " MPa";
             const sf = mat.Yield / (maxVMGlobal + 0.01);
             dom.rSf.innerText = sf.toFixed(2);
@@ -408,27 +954,15 @@
             const rOut = state.De/2, rIn = state.Di/2, rG = state.grubDi/2, mat = materials[state.matId];
             const scale = 2.4, cx = w/2, cz = h/2, pZ = H_BASE/2;
 
-            for(let x=-W_BASE; x<=W_BASE; x+=1.2) {
-                for(let z=0; z<=H_BASE; z+=1.2) {
-                    const hw = getProfileHalfWidth(ySlice);
-                    if (Math.abs(x) > hw) continue;
-                    if (x*x + ySlice*ySlice < rIn**2) continue;
-                    
-                    const distGrub = safeSqrt(ySlice**2 + (z - pZ)**2);
-                    if (state.grubDi > 0.1 && distGrub < rG && x > rIn * 0.9) {
-                        ctx.fillStyle = "#ffffff"; ctx.fillRect(cx + x*scale, h - z*scale, 2, 2); continue;
-                    }
-
-                    const bend = (state.force * (L_TOTAL - ySlice) * (z - pZ)) / ((W_BASE*Math.pow(H_BASE,3))/12);
-                    let kt = 1.0;
-                    if (state.grubDi > 0.1 && x > rIn) kt = 1.0 + 3.8 * Math.pow(rG/distGrub, 2.2);
-
-                    const vm = Math.abs(bend) * kt + (ySlice < 0 ? 15 : 0);
+            // Draw mesh nodes in the slice
+            nodes.forEach(node => {
+                if (Math.abs(node.y - ySlice) < state.meshRes * 0.8) {
+                    const vm = node.vm || 0;
                     const t = clamp(vm / mat.Yield, 0, 1);
                     ctx.fillStyle = `#${new THREE.Color().setHSL(0.66*(1-t), 1, 0.5).getHexString()}`;
-                    ctx.fillRect(cx + x*scale, h - z*scale, 2, 2);
+                    ctx.fillRect(cx + node.x*scale, h - node.z*scale, 3, 3);
                 }
-            }
+            });
         }
 
         function updateAccessories() {

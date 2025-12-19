@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Analisi FEM Professionale - Suite V83 Fixed</title>
+    <style>
+        body { margin: 0; overflow: hidden; font-family: 'Segoe UI', system-ui, sans-serif; background-color: #050505; color: #fff; }
+        #canvas-container { width: 100%; height: 100vh; display: block; }
+        
+        #ui-panel {
+            position: absolute; top: 15px; right: 15px; width: 340px;
+            background: rgba(15, 15, 20, 0.98); padding: 0; border-radius: 12px;
+            border: 1px solid #333; border-top: 4px solid #007acc;
+            box-shadow: 0 15px 35px rgba(0,0,0,0.8);
+            max-height: 94vh; overflow-y: auto; z-index: 100; backdrop-filter: blur(15px);
+        }
+
+        .panel-header { padding: 18px; background: #111; border-bottom: 1px solid #222; }
+        .panel-header h2 { margin: 0; font-size: 14px; text-transform: uppercase; letter-spacing: 1.5px; color: #00bfff; }
+        .panel-body { padding: 18px; }
+
+        h4 { margin: 12px 0 6px 0; font-size: 10px; color: #666; text-transform: uppercase; border-bottom: 1px solid #222; padding-bottom: 4px; }
+        .control-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .label-text { font-size: 11px; color: #aaa; }
+        .val { font-family: 'JetBrains Mono', monospace; color: #00bfff; font-weight: bold; font-size: 12px; }
+
+        input[type="range"] { width: 100%; margin: 4px 0 12px 0; -webkit-appearance: none; height: 3px; background: #333; border-radius: 2px; outline: none; }
+        input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; background: #007acc; border-radius: 50%; cursor: pointer; border: 2px solid #fff; box-shadow: 0 0 10px rgba(0,122,204,0.5); }
+        select { width: 100%; background: #1a1a20; border: 1px solid #444; color: white; padding: 8px; margin-bottom: 12px; border-radius: 6px; font-size: 11px; }
+
+        .results-card { background: #0a0a0a; border-radius: 8px; padding: 12px; border: 1px solid #222; margin-top: 15px; }
+        .stat-line { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 11px; }
+        .status-badge { 
+            width: 100%; padding: 10px; border-radius: 6px; text-align: center; 
+            font-weight: bold; font-size: 12px; text-transform: uppercase; margin-top: 8px;
+        }
+        .safe { background: #0a3d1b; color: #4dff88; border: 1px solid #1a5c2d; }
+        .warning { background: #3d330a; color: #ffcc00; border: 1px solid #5c4d1a; }
+        .danger { background: #3d0a0a; color: #ff4d4d; border: 1px solid #5c1a1a; }
+        
+        #crit-panel {
+            position: absolute; bottom: 30px; left: 30px; width: 260px;
+            background: rgba(10, 10, 15, 0.95); border: 1px solid #444; border-radius: 8px; padding: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 50;
+        }
+        canvas#crit-canvas { width: 100%; height: 160px; background: #000; border-radius: 4px; border: 1px solid #222; }
+
+        #legend {
+            position: absolute; bottom: 30px; left: 310px;
+            background: rgba(10, 10, 10, 0.9); padding: 15px; border-radius: 8px;
+            border: 1px solid #333; z-index: 50;
+        }
+        .gradient-bar { width: 20px; height: 180px; background: linear-gradient(to top, #30123b, #4686fb, #1ae4b6, #a4fc3b, #f19e0d, #d12e08, #7a0403); border-radius: 3px; border: 1px solid #444; }
+        .legend-labels { height: 180px; display: flex; flex-direction: column; justify-content: space-between; font-family: monospace; font-size: 10px; margin-left: 10px; color: #888; }
+
+        #solver-toast {
+            position: fixed; bottom: 20px; right: 370px; padding: 12px 20px;
+            background: #007acc; color: white; border-radius: 6px; font-size: 12px;
+            font-weight: bold; display: none; z-index: 200; box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+        }
+
+        #loader { position: fixed; top:0; left:0; width:100%; height:100%; background:#050505; display:flex; flex-direction:column; justify-content:center; align-items:center; z-index:1000; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+          "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+      }
+    </script>
+</head>
+<body>
+
+    <div id="loader">
+        <div style="border: 3px solid #222; border-top: 3px solid #00bfff; border-radius: 50%; width: 50px; height: 50px; animation: spin 0.8s linear infinite;"></div>
+        <div style="margin-top: 25px; color:#00bfff; font-size: 11px; letter-spacing: 3px; font-weight: bold;">RIPRISTINO VARIABILI GLOBALI V83...</div>
+    </div>
+
+    <div id="solver-toast">CALCOLO EQUILIBRIO ELASTICO...</div>
+
+    <div id="canvas-container"></div>
+
+    <div id="ui-panel">
+        <div class="panel-header"><h2>FEM Master Pro V83</h2></div>
+        <div class="panel-body">
+            
+            <h4>Precisione Mesh</h4>
+            <div class="control-row"><span class="label-text">Densit&agrave; Mesh (Res)</span><span id="v-mesh-res" class="val">--</span></div>
+            <input type="range" id="i-mesh-res" min="1.0" max="4.0" step="0.1" value="1.8">
+            <div style="font-size:9px; color:#666; margin-bottom:10px;">Valori bassi = Mesh più fitta (più lento ma più preciso)</div>
+
+            <h4>Geometria e Raccordo</h4>
+            <div class="control-row"><span class="label-text">Raggio Curvatura</span><span id="v-fillet" class="val">--</span></div>
+            <input type="range" id="i-fillet" min="0" max="40" step="1" value="20">
+
+            <div class="control-row"><span class="label-text">Tipo Profilo</span></div>
+            <select id="sel-fillet-type">
+                <option value="convex" selected>Convesso (Rinforzato)</option>
+                <option value="concave">Concavo (Svasato)</option>
+            </select>
+
+            <div class="control-row"><span class="label-text">Transizione (Delta)</span><span id="v-delta" class="val">--</span></div>
+            <input type="range" id="i-delta" min="10" max="80" step="2" value="40">
+
+            <h4>Foro Grano</h4>
+            <div class="control-row"><span class="label-text">Ø Grano (mm)</span><span id="v-grub" class="val">--</span></div>
+            <input type="range" id="i-grub" min="0" max="12" step="0.5" value="6.0">
+
+            <h4>Accoppiamento</h4>
+            <div class="control-row"><span class="label-text">Ø Foro Spina (Di)</span><span id="v-di" class="val">--</span></div>
+            <input type="range" id="i-di" min="8" max="30" step="1" value="15">
+
+            <div class="control-row"><span class="label-text">Ø Esterno (De)</span><span id="v-de" class="val">--</span></div>
+            <input type="range" id="i-de" min="20" max="100" step="1" value="40">
+
+            <div class="control-row"><span class="label-text">Gioco Meccanico (mm)</span><span id="v-clearance" class="val">--</span></div>
+            <input type="range" id="i-clearance" min="0" max="1.0" step="0.05" value="0.10">
+
+            <h4>Analisi Carico</h4>
+            <div class="control-row"><span class="label-text">Forza Carico (N)</span><span id="v-force" class="val">--</span></div>
+            <input type="range" id="i-force" min="0" max="40000" step="100" value="4500">
+
+            <select id="sel-mat">
+                <option value="al_pd" selected>Alluminio Pressofuso - 140 MPa</option>
+                <option value="al_g">Alluminio T6 - 210 MPa</option>
+                <option value="zamak">Zamak 27 (Zinco) - 370 MPa</option>
+            </select>
+
+            <h4>Sezione</h4>
+            <div class="control-row"><span class="label-text" style="color:#007acc">Slicer Y</span><span id="v-clip" class="val">--</span></div>
+            <input type="range" id="i-clip" min="-25" max="150" step="1" value="150">
+
+            <div class="results-card">
+                <div class="stat-line"><span>Stress Von Mises Max</span><span id="r-stress" class="val">-- MPa</span></div>
+                <div class="stat-line"><span>Safety Factor</span><span id="r-sf" class="val">--</span></div>
+                <div id="r-status-box" class="status-badge">---</div>
+            </div>
+            
+            <div class="control-row" style="margin-top:10px;">
+                <span class="label-text">Mostra Mesh (Wireframe)</span>
+                <input type="checkbox" id="chk-wireframe">
+            </div>
+        </div>
+    </div>
+
+    <div id="crit-panel">
+        <canvas id="crit-canvas"></canvas>
+    </div>
+
+    <div id="legend">
+        <div class="gradient-bar"></div>
+        <div class="legend-labels">
+            <div id="l-max">MAX</div>
+            <div id="l-mid">MID</div>
+            <div>0</div>
+        </div>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- SOLUTORE FEM PRO V83 ---
+        const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+        const safeSqrt = (v) => v > 1e-9 ? Math.sqrt(v) : 0;
+
+        const W_BASE = 30, H_BASE = 50, L_TOTAL = 100, Y_LOAD = 100;
+        const materials = {
+            'al_pd': { E: 71000, Yield: 140 },
+            'al_g':  { E: 74000, Yield: 210 },
+            'zamak': { E: 85000, Yield: 370 }
+        };
+
+        const state = {
+            meshRes: 2.0, delta: 40, De: 40, Di: 15, grubDi: 6.0, clearance: 0.1, force: 4500, fillet: 20, filletType: 'convex', matId: 'al_pd', clipY: 150, showWireframe: false
+        };
+
+        let scene, camera, renderer, controls, clipPlane, mainMesh, wireMesh, pinMesh, grubMesh, forceArrow;
+        let nodes = [], elements = [], dom = {};
+
+        function init() {
+            const container = document.getElementById('canvas-container');
+            const getEl = (id) => document.getElementById(id);
+            
+            dom = {
+                meshRes: getEl('i-mesh-res'), vMeshRes: getEl('v-mesh-res'),
+                fillet: getEl('i-fillet'), vFillet: getEl('v-fillet'),
+                grub: getEl('i-grub'), vGrub: getEl('v-grub'),
+                de: getEl('i-de'), vDe: getEl('v-de'),
+                di: getEl('i-di'), vDi: getEl('v-di'),
+                delta: getEl('i-delta'), vDelta: getEl('v-delta'),
+                filletType: getEl('sel-fillet-type'),
+                force: getEl('i-force'), vForce: getEl('v-force'),
+                clip: getEl('i-clip'), vClip: getEl('v-clip'),
+                mat: getEl('sel-mat'),
+                wireframe: getEl('chk-wireframe'),
+                rStress: getEl('r-stress'), rSf: getEl('r-sf'), rStatus: getEl('r-status-box'),
+                lMax: getEl('l-max'), lMid: getEl('l-mid'),
+                critCanvas: getEl('crit-canvas'),
+                toast: getEl('solver-toast')
+            };
+
+            scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x0a0a0c);
+            camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 1, 3000);
+            camera.position.set(200, 180, 200);
+            camera.up.set(0, 0, 1);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.localClippingEnabled = true;
+            container.appendChild(renderer.domElement);
+
+            controls = new OrbitControls(camera, renderer.domElement);
+            controls.target.set(0, 40, 25);
+            controls.enableDamping = true;
+
+            scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+            const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+            sun.position.set(100, 100, 150);
+            scene.add(sun);
+
+            clipPlane = new THREE.Plane(new THREE.Vector3(0, -1, 0), state.clipY);
+
+            document.querySelectorAll('input, select').forEach(el => {
+                el.addEventListener('input', handleUpdate);
+            });
+
+            rebuildFEM();
+            animate();
+            setTimeout(() => { document.getElementById('loader').style.display = 'none'; }, 800);
+        }
+
+        function handleUpdate() {
+            if (!dom.delta || !dom.meshRes || !dom.clip || !dom.di) return;
+
+            state.meshRes = parseFloat(dom.meshRes.value);
+            state.fillet = parseFloat(dom.fillet.value);
+            state.De = parseFloat(dom.de.value);
+            state.Di = parseFloat(dom.di.value);
+            state.delta = parseFloat(dom.delta.value);
+            state.grubDi = parseFloat(dom.grub.value);
+            state.force = parseFloat(dom.force.value);
+            state.clipY = parseFloat(dom.clip.value);
+            state.filletType = dom.filletType.value;
+            state.matId = dom.mat.value;
+            state.showWireframe = dom.wireframe.checked;
+
+            dom.vMeshRes.innerText = state.meshRes.toFixed(1) + " mm";
+            dom.vFillet.innerText = state.fillet + " mm";
+            dom.vDe.innerText = state.De + " mm";
+            dom.vDi.innerText = state.Di + " mm";
+            dom.vDelta.innerText = state.delta + " mm";
+            dom.vGrub.innerText = state.grubDi.toFixed(1) + " mm";
+            dom.vForce.innerText = state.force + " N";
+            dom.vClip.innerText = state.clipY > 140 ? "OFF" : state.clipY + " mm";
+            clipPlane.constant = state.clipY;
+
+            rebuildFEM();
+        }
+
+        function getProfileHalfWidth(y) {
+            const hw_block = W_BASE / 2, hw_hub = state.De / 2;
+            if (y >= state.delta) return hw_block; 
+            if (y <= 0) {
+                const dy = Math.abs(y);
+                return dy > hw_hub ? 0.05 : safeSqrt(hw_hub**2 - dy**2);
+            }
+            const t = clamp(y / state.delta, 0, 1), s = (3 * t**2 - 2 * t**3); 
+            const neckEffect = state.fillet * Math.sin(t * Math.PI); 
+            let currentHW;
+            if (state.filletType === 'convex') currentHW = hw_hub + (hw_block - hw_hub) * s + neckEffect;
+            else currentHW = hw_hub + (hw_block - hw_hub) * s - neckEffect;
+            return Math.max(1, currentHW);
+        }
+
+        function rebuildFEM() {
+            dom.toast.style.display = 'block';
+            if (mainMesh) { scene.remove(mainMesh); mainMesh.geometry.dispose(); }
+            if (wireMesh) { scene.remove(wireMesh); wireMesh.geometry.dispose(); }
+            
+            nodes = [];
+            elements = [];
+            const rIn = state.Di / 2, rGrub = state.grubDi / 2, rOut = state.De / 2, pivotZ = H_BASE / 2;
+            const step = state.meshRes;
+
+            let nodeMap = new Map();
+            function getNode(x, y, z) {
+                const key = `${x.toFixed(2)},${y.toFixed(2)},${z.toFixed(2)}`;
+                if (nodeMap.has(key)) return nodeMap.get(key);
+                const node = { x, y, z, vm: 0 };
+                nodes.push(node);
+                nodeMap.set(key, nodes.length - 1);
+                return nodes.length - 1;
+            }
+
+            const xSegments = 16; 
+
+            for (let y = -rOut; y < L_TOTAL; y += step) {
+                const hw0 = getProfileHalfWidth(y);
+                const hw1 = getProfileHalfWidth(y + step);
+                
+                for (let x_idx = -xSegments; x_idx < xSegments; x_idx++) {
+                    const tx0 = x_idx / xSegments, tx1 = (x_idx + 1) / xSegments;
+                    const x0a = tx0 * hw0, x0b = tx1 * hw0;
+                    const x1a = tx0 * hw1, x1b = tx1 * hw1;
+
+                    for (let z = 0; z < H_BASE; z += step) {
+                        const midX = (x0a + x0b) / 2;
+                        const distPin = safeSqrt(midX**2 + y**2);
+                        const distGrub = safeSqrt(y**2 + (z - pivotZ)**2);
+                        
+                        if (distPin < rIn) continue;
+                        if (state.grubDi > 0.1 && distGrub < rGrub && midX > rIn * 0.9) continue;
+
+                        const n = [
+                            getNode(x0a, y, z), getNode(x0b, y, z),
+                            getNode(x1b, y+step, z), getNode(x1a, y+step, z),
+                            getNode(x0a, y, z+step), getNode(x0b, y, z+step),
+                            getNode(x1b, y+step, z+step), getNode(x1a, y+step, z+step)
+                        ];
+                        elements.push({ nodes: n });
+                    }
+                }
+            }
+
+            const mat = materials[state.matId];
+            const inertia_ref = (W_BASE * Math.pow(H_BASE, 3)) / 12;
+
+            nodes.forEach(n => {
+                const arm = Math.max(0, L_TOTAL - n.y);
+                const moment = state.force * arm;
+                const s_bend = (moment * (n.z - pivotZ)) / inertia_ref;
+                
+                let contactS = 0;
+                if (Math.abs(n.y) < rOut) {
+                    const z_rel = (n.z - pivotZ) / (H_BASE/2);
+                    if ((n.y > 0 && z_rel < -0.25) || (n.y < 0 && z_rel > 0.25)) contactS = (state.force / (state.Di * H_BASE)) * 52.0;
+                }
+
+                let Kt = 1.0;
+                const dG = safeSqrt(n.y**2 + (n.z - pivotZ)**2);
+                if (state.grubDi > 0.1 && dG < rGrub * 5 && n.x > rIn) {
+                    Kt = 1.0 + 3.8 * Math.pow(rGrub / dG, 2.2);
+                }
+
+                n.vm = safeSqrt((s_bend + contactS)**2) * Kt;
+            });
+
+            const geometry = new THREE.BufferGeometry();
+            const positions = [];
+            const colors = [];
+            const colorObj = new THREE.Color();
+
+            elements.forEach(el => {
+                const ns = el.nodes.map(id => nodes[id]);
+                const avgVM = ns.reduce((acc, n) => acc + n.vm, 0) / 8;
+                const t = clamp(avgVM / mat.Yield, 0, 1.2);
+                colorObj.setHSL(0.66 * (1 - Math.min(t, 1)), 1, 0.5);
+                if (avgVM > mat.Yield) colorObj.setRGB(1, 1, 1);
+
+                const faces = [[0,1,2,3], [4,5,6,7], [0,1,5,4], [1,2,6,5], [2,3,7,6], [3,0,4,7]];
+                faces.forEach(f => {
+                    const p1 = ns[f[0]], p2 = ns[f[1]], p3 = ns[f[2]], p4 = ns[f[3]];
+                    positions.push(p1.x, p1.y, p1.z, p2.x, p2.y, p2.z, p3.x, p3.y, p3.z);
+                    positions.push(p1.x, p1.y, p1.z, p3.x, p3.y, p3.z, p4.x, p4.y, p4.z);
+                    for(let i=0; i<6; i++) colors.push(colorObj.r, colorObj.g, colorObj.b);
+                });
+            });
+
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+            geometry.computeVertexNormals();
+
+            mainMesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial({ 
+                vertexColors: true, side: THREE.DoubleSide, clippingPlanes: [clipPlane], roughness: 0.5, metalness: 0.2
+            }));
+            scene.add(mainMesh);
+
+            if (state.showWireframe) {
+                wireMesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ color: 0x000000, wireframe: true, transparent: true, opacity: 0.15 }));
+                scene.add(wireMesh);
+            }
+
+            const maxVMGlobal = nodes.length > 0 ? Math.max(...nodes.map(n => n.vm)) : 0;
+            dom.rStress.innerText = maxVMGlobal.toFixed(1) + " MPa";
+            const sf = mat.Yield / (maxVMGlobal + 0.01);
+            dom.rSf.innerText = sf.toFixed(2);
+            dom.rStatus.className = "status-badge " + (sf < 1.0 ? "danger" : sf < 1.3 ? "warning" : "safe");
+            dom.rStatus.innerText = sf < 1.0 ? "CEDIMENTO" : sf < 1.3 ? "CRITICO" : "SICURO";
+            dom.lMax.innerText = mat.Yield; dom.lMid.innerText = (mat.Yield/2).toFixed(0);
+
+            updateAccessories();
+            drawSection();
+            setTimeout(() => { dom.toast.style.display = 'none'; }, 400);
+        }
+
+        function drawSection() {
+            const canvas = dom.critCanvas, ctx = canvas.getContext('2d');
+            const w = canvas.width = 240, h = canvas.height = 160;
+            ctx.fillStyle = '#050505'; ctx.fillRect(0, 0, w, h);
+            
+            const ySlice = state.clipY < 140 ? state.clipY : 0;
+            const rOut = state.De/2, rIn = state.Di/2, rG = state.grubDi/2, mat = materials[state.matId];
+            const scale = 2.4, cx = w/2, cz = h/2, pZ = H_BASE/2;
+
+            for(let x=-W_BASE; x<=W_BASE; x+=1.2) {
+                for(let z=0; z<=H_BASE; z+=1.2) {
+                    const hw = getProfileHalfWidth(ySlice);
+                    if (Math.abs(x) > hw) continue;
+                    if (x*x + ySlice*ySlice < rIn**2) continue;
+                    
+                    const distGrub = safeSqrt(ySlice**2 + (z - pZ)**2);
+                    if (state.grubDi > 0.1 && distGrub < rG && x > rIn * 0.9) {
+                        ctx.fillStyle = "#ffffff"; ctx.fillRect(cx + x*scale, h - z*scale, 2, 2); continue;
+                    }
+
+                    const bend = (state.force * (L_TOTAL - ySlice) * (z - pZ)) / ((W_BASE*Math.pow(H_BASE,3))/12);
+                    let kt = 1.0;
+                    if (state.grubDi > 0.1 && x > rIn) kt = 1.0 + 3.8 * Math.pow(rG/distGrub, 2.2);
+
+                    const vm = Math.abs(bend) * kt + (ySlice < 0 ? 15 : 0);
+                    const t = clamp(vm / mat.Yield, 0, 1);
+                    ctx.fillStyle = `#${new THREE.Color().setHSL(0.66*(1-t), 1, 0.5).getHexString()}`;
+                    ctx.fillRect(cx + x*scale, h - z*scale, 2, 2);
+                }
+            }
+        }
+
+        function updateAccessories() {
+            if (pinMesh) scene.remove(pinMesh);
+            pinMesh = new THREE.Mesh(new THREE.CylinderGeometry(state.Di/2-0.1, state.Di/2-0.1, 85, 32).rotateX(Math.PI/2), new THREE.MeshStandardMaterial({color: 0x666666, metalness: 0.8}));
+            pinMesh.position.set(0,0,H_BASE/2); scene.add(pinMesh);
+            if (grubMesh) scene.remove(grubMesh);
+            if (state.grubDi > 0.1) {
+                grubMesh = new THREE.Mesh(new THREE.CylinderGeometry(state.grubDi/2-0.1, state.grubDi/2-0.1, 20, 16).rotateZ(Math.PI/2), new THREE.MeshStandardMaterial({color: 0x333333, metalness: 0.5}));
+                grubMesh.position.set(state.De/2 - 2, 0, H_BASE/2); scene.add(grubMesh);
+            }
+            if (forceArrow) scene.remove(forceArrow);
+            const dir = new THREE.Vector3(0, -1, 0).normalize();
+            forceArrow = new THREE.ArrowHelper(dir, new THREE.Vector3(0, Y_LOAD, H_BASE/2), 35, 0x00ff00); 
+            scene.add(forceArrow);
+        }
+
+        function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); }
+        init();
+        window.addEventListener('resize', () => { camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); });
+    </script>
+</body>
+</html>
